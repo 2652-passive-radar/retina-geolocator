@@ -116,10 +116,37 @@ def _enu_km_to_lla(east_km, north_km, up_km, ref_lat, ref_lon, ref_alt_m):
     return Geometry.ecef2lla(ecef[0], ecef[1], ecef[2])
 
 
+def _rx_velocity_ms(cfg):
+    """The receiver's own velocity from a node config, m/s in the receiver's
+    local ENU frame, or None for a receiver that is not moving.
+
+    Read from the optional ``rx_vel_east_ms``, ``rx_vel_north_ms`` and
+    ``rx_vel_up_ms`` keys; absent, null or all zero means stationary, so every
+    existing config solves exactly as before.
+    """
+    v = tuple(float(cfg.get(k) or 0.0) for k in ("rx_vel_east_ms", "rx_vel_north_ms", "rx_vel_up_ms"))
+    return v if any(v) else None
+
+
+def _rx_velocity_in_frame_kms(v_ms, rx_lat, rx_lon, rx_alt_m, ref_lat, ref_lon, ref_alt_m):
+    """A velocity given in the receiver's local ENU frame, rotated into the
+    solver's ENU frame at the reference point, in km/s.
+
+    The two frames differ by the angle subtended at the Earth's centre (~0.5
+    degree at 60 km), which is a 0.1 m/s error at walking-to-driving speeds:
+    small, but free to remove, so the vector goes through ECEF exactly.
+    """
+    tip = Geometry.enu2ecef(v_ms[0], v_ms[1], v_ms[2], rx_lat, rx_lon, rx_alt_m)
+    tail = Geometry.lla2ecef(rx_lat, rx_lon, rx_alt_m)
+    a = Geometry.ecef2enu(tip[0], tip[1], tip[2], ref_lat, ref_lon, ref_alt_m)
+    b = Geometry.ecef2enu(tail[0], tail[1], tail[2], ref_lat, ref_lon, ref_alt_m)
+    return tuple((a[i] - b[i]) * 1e-3 for i in range(3))
+
+
 class NodeSetup:
     """Pre-computed geometry for a single node used by the solver."""
 
-    def __init__(self, node_id, rx_enu_km, tx_enu_km, fc_hz):
+    def __init__(self, node_id, rx_enu_km, tx_enu_km, fc_hz, rx_vel_kms=None):
         self.node_id = node_id
         # Store as plain tuples so the inner loops use fast Python attribute access
         # without numpy array creation overhead on every residual evaluation.
@@ -131,6 +158,23 @@ class NodeSetup:
         self.d_baseline_km = math.sqrt((rx[0] - tx[0]) ** 2 + (rx[1] - tx[1]) ** 2 + (rx[2] - tx[2]) ** 2)
         # fc / c  (Hz per km/s) — used for Doppler prediction.
         self.K_doppler = fc_hz / _C_KM_S
+        # A moving receiver adds its own Doppler to every detection:
+        #   f_rx = (fc/c) (u_RP + u_TR) . v_R
+        # with u_RP the unit vector from the receiver to the target and u_TR
+        # from the transmitter to the receiver (the second term is the
+        # reference path's own Doppler, which the delay-Doppler map subtracts).
+        # u_RP = -u_rx (u_rx points from the target to the receiver, as in the
+        # residuals), so f_rx = rx_dop_const - K * (u_rx . v_R): a constant per
+        # node plus one term that depends on where the target is.  None for a
+        # stationary receiver, which then costs nothing in the inner loops.
+        self.rx_vel = None
+        self.rx_dop_const = 0.0
+        if rx_vel_kms is not None and any(rx_vel_kms):
+            self.rx_vel = tuple(rx_vel_kms)
+            if self.d_baseline_km > 0:
+                inv_b = 1.0 / self.d_baseline_km
+                u_tr = ((rx[0] - tx[0]) * inv_b, (rx[1] - tx[1]) * inv_b, (rx[2] - tx[2]) * inv_b)
+                self.rx_dop_const = self.K_doppler * sum(u_tr[i] * self.rx_vel[i] for i in range(3))
 
 
 class MultiNodeMeasurement:
@@ -194,6 +238,9 @@ def _residual_function(state, node_setups, measurements, z_fixed_km):
         v_tx = vx * utx0 + vy * utx1 + vz * utx2
         v_rx = vx * urx0 + vy * urx1 + vz * urx2
         pred_doppler = ns.K_doppler * (v_tx + v_rx)
+        rv = ns.rx_vel
+        if rv is not None:
+            pred_doppler += ns.rx_dop_const - ns.K_doppler * (urx0 * rv[0] + urx1 * rv[1] + urx2 * rv[2])
 
         weight = min(m.snr / 10.0, 3.0) if m.snr > 0 else 1.0
         residuals.append((m.delay_us - pred_delay) * weight / _SIGMA_DELAY_US)
@@ -266,6 +313,11 @@ def _jacobian_function(state, node_setups, measurements, z_fixed_km):
         w01 = -wf * K
         dr2_dx = w01 * ((-vx + v_tx * utx0) * inv_dptx + (-vx + v_rx * urx0) * inv_dprx)
         dr2_dy = w01 * ((-vy + v_tx * utx1) * inv_dptx + (-vy + v_rx * urx1) * inv_dprx)
+        rv = ns.rx_vel
+        if rv is not None:
+            s_rx = urx0 * rv[0] + urx1 * rv[1] + urx2 * rv[2]
+            dr2_dx -= w01 * (-rv[0] + s_rx * urx0) * inv_dprx
+            dr2_dy -= w01 * (-rv[1] + s_rx * urx1) * inv_dprx
         dr2_dvx = w01 * (utx0 + urx0) * INV1000
         dr2_dvy = w01 * (utx1 + urx1) * INV1000
         dr2_dvz = w01 * (utx2 + urx2) * INV1000
@@ -316,6 +368,9 @@ def _residual_function_free(state, node_setups, measurements):
         v_tx = vx * utx0 + vy * utx1 + vz * utx2
         v_rx = vx * urx0 + vy * urx1 + vz * urx2
         pred_doppler = ns.K_doppler * (v_tx + v_rx)
+        rv = ns.rx_vel
+        if rv is not None:
+            pred_doppler += ns.rx_dop_const - ns.K_doppler * (urx0 * rv[0] + urx1 * rv[1] + urx2 * rv[2])
 
         weight = min(m.snr / 10.0, 3.0) if m.snr > 0 else 1.0
         residuals.append((m.delay_us - pred_delay) * weight / _SIGMA_DELAY_US)
@@ -386,6 +441,12 @@ def _jacobian_function_free(state, node_setups, measurements):
         dr2_dx = w01 * ((-vx + v_tx * utx0) * inv_dptx + (-vx + v_rx * urx0) * inv_dprx)
         dr2_dy = w01 * ((-vy + v_tx * utx1) * inv_dptx + (-vy + v_rx * urx1) * inv_dprx)
         dr2_dz = w01 * ((-vz + v_tx * utx2) * inv_dptx + (-vz + v_rx * urx2) * inv_dprx)
+        rv = ns.rx_vel
+        if rv is not None:
+            s_rx = urx0 * rv[0] + urx1 * rv[1] + urx2 * rv[2]
+            dr2_dx -= w01 * (-rv[0] + s_rx * urx0) * inv_dprx
+            dr2_dy -= w01 * (-rv[1] + s_rx * urx1) * inv_dprx
+            dr2_dz -= w01 * (-rv[2] + s_rx * urx2) * inv_dprx
         dr2_dvx = w01 * (utx0 + urx0) * INV1000
         dr2_dvy = w01 * (utx1 + urx1) * INV1000
         dr2_dvz = w01 * (utx2 + urx2) * INV1000
@@ -519,6 +580,10 @@ def fit_constant_velocity(fit_input, node_configs, *, fix_altitude=False):
                                           "doppler_hz", "snr"}, ...]}, ...],
         }
         node_configs: dict[node_id] → config with rx/tx lat/lon/alt and fc_hz.
+            Receivers are taken as stationary over the window: a moving
+            receiver's rx_vel_* keys are ignored here (each epoch would need
+            its own receiver position), so the fit is only valid for nodes
+            that are not moving.
         fix_altitude: keyword-only.  Pin z to initial_guess.alt_km and hold
             vz = 0, fitting the 4-state [x, y, vx, vy] instead of the 6-state.
             Default False — every existing caller gets the free-z fit it had.
@@ -723,7 +788,14 @@ def solve_multinode(solver_input, node_configs, free_altitude=False):
                 "timestamp_ms": int,
             }
         node_configs: dict[node_id] → config dict with
-            rx_lat, rx_lon, rx_alt_ft, tx_lat, tx_lon, tx_alt_ft, fc_hz/FC
+            rx_lat, rx_lon, rx_alt_ft, tx_lat, tx_lon, tx_alt_ft, fc_hz/FC,
+            and for a receiver that is moving, its position at this frame in
+            rx_lat/rx_lon/rx_alt_ft and its velocity in the optional
+            rx_vel_east_ms / rx_vel_north_ms / rx_vel_up_ms (m/s, the
+            receiver's local ENU).  The receiver's own Doppler is then part of
+            the model, so the measured Doppler is used as it arrives.  Absent
+            or zero velocity is a stationary receiver, solved exactly as
+            before.
         free_altitude: solve altitude as a sixth unknown instead of pinning it
             to initial_guess.alt_km.  Default False — the pinned solve is what
             every existing caller gets, unchanged.  Ignored (pinned anyway)
@@ -801,7 +873,15 @@ def solve_multinode(solver_input, node_configs, free_altitude=False):
             ref_alt_m,
         )
         fc_hz = cfg.get("fc_hz", cfg.get("FC", 195e6))
-        node_setups[nid] = NodeSetup(nid, rx_enu, tx_enu, fc_hz)
+        rx_vel_ms = _rx_velocity_ms(cfg)
+        rx_vel_kms = (
+            None
+            if rx_vel_ms is None
+            else _rx_velocity_in_frame_kms(
+                rx_vel_ms, cfg.get("rx_lat", 0), cfg.get("rx_lon", 0), rx_alt_m, ref_lat, ref_lon, ref_alt_m
+            )
+        )
+        node_setups[nid] = NodeSetup(nid, rx_enu, tx_enu, fc_hz, rx_vel_kms)
 
     # Build measurement objects
     measurements = []
@@ -967,6 +1047,9 @@ def solve_multinode(solver_input, node_configs, free_altitude=False):
         pred_f = ns.K_doppler * (
             vx_kms * utx0 + vy_kms * utx1 + vz_kms * utx2 + vx_kms * urx0 + vy_kms * urx1 + vz_kms * urx2
         )
+        rv = ns.rx_vel
+        if rv is not None:
+            pred_f += ns.rx_dop_const - ns.K_doppler * (urx0 * rv[0] + urx1 * rv[1] + urx2 * rv[2])
         delay_residuals.append(m.delay_us - pred_d)
         doppler_residuals.append(m.doppler_hz - pred_f)
 
